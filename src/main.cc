@@ -195,6 +195,7 @@ int main()
         HidDevice device(0x1edb, 0xda0e);
         authenticate(device);
 
+        device.send({3, 0,0,0,0,0,0});
         for (;;)
         {
             auto data = device.recv();
