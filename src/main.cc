@@ -3,10 +3,25 @@
 #include <unistd.h>
 #include <exception>
 #include <vector>
+#include <set>
+#include <algorithm>
+#include <ranges>
 #include <hidapi.h>
 #include <fmt/format.h>
+#include <fakekey/fakekey.h>
+#include <X11/Xlib.h>
+#include <X11/Xatom.h>
 
 #define MAX_STR 255
+
+static Display* display;
+static Window window;
+static FakeKey* fakekey;
+static std::set<uint16_t> currentKeyboardState;
+static int min_keycode, max_keycode;
+static int n_keysyms_per_keycode;
+static KeySym* keysyms;
+static int lastModifiedKey = 0;
 
 static void checkerror(int res)
 {
@@ -29,7 +44,8 @@ static uint64_t rol8n(uint64_t v, int n)
     return v;
 }
 
-/* Authentication code borrowed from https://github.com/smunaut/blackmagic-misc. */
+/* Authentication code borrowed from https://github.com/smunaut/blackmagic-misc.
+ */
 static uint64_t calculateKeyboardResponse(uint64_t challenge)
 {
     static const uint64_t auth_even_tbl[] = {
@@ -67,6 +83,11 @@ static uint64_t calculateKeyboardResponse(uint64_t challenge)
     }
 
     return v ^ (rol8(v) & mask) ^ k;
+}
+
+static uint64_t getInt16(const uint8_t* p)
+{
+    return ((uint64_t)p[0] << 0) | ((uint64_t)p[1] << 8);
 }
 
 static uint64_t getInt64(const uint8_t* p)
@@ -188,21 +209,97 @@ static void authenticate(HidDevice& device)
         throw HidException("unable to authenticate keyboard");
 }
 
+static void pressReleaseKey(int keynum, bool pressed, int flags)
+{
+    KeySym keysym = (keynum + 0xe000) | 0x1000000;
+    KeyCode code = XKeysymToKeycode(display, keysym);
+    if (!code)
+    {
+        lastModifiedKey = (lastModifiedKey + 1) % 10;
+
+        int index = (max_keycode - min_keycode - lastModifiedKey - 1) *
+                    n_keysyms_per_keycode;
+        keysyms[index] = keysym;
+
+        XChangeKeyboardMapping(display,
+            min_keycode,
+            n_keysyms_per_keycode,
+            keysyms,
+            max_keycode - min_keycode);
+        XSync(display, False);
+
+        code = XKeysymToKeycode(display, keysym);
+    }
+
+    fakekey_send_keyevent(fakekey, code, pressed, flags);
+}
+
 int main()
 {
+    display = XOpenDisplay(nullptr);
+    window = XDefaultRootWindow(display);
+    fakekey = fakekey_init(display);
+    atexit(
+        []()
+        {
+            for (uint16_t k : currentKeyboardState)
+                pressReleaseKey(k, false, 0);
+        });
+
+    XDisplayKeycodes(display, &min_keycode, &max_keycode);
+
+    keysyms = XGetKeyboardMapping(display,
+        min_keycode,
+        max_keycode - min_keycode + 1,
+        &n_keysyms_per_keycode);
+
     hid_init();
     {
         HidDevice device(0x1edb, 0xda0e);
         authenticate(device);
 
-        device.send({3, 0,0,0,0,0,0});
+        device.send({3, 0, 0, 0, 0, 0, 0});
         for (;;)
         {
             auto data = device.recv();
+            switch (data[0])
+            {
+                case 4:
+                {
+                    /* Keyboard packet */
+                    std::set<uint16_t> newKeyboardState;
+                    for (int i = 0; i < 6; i++)
+                    {
+                        uint16_t keycode = getInt16(&data[1 + i * 2]);
+                        if (keycode)
+                            newKeyboardState.insert(getInt16(&data[1 + i * 2]));
+                    }
 
-            for (uint8_t c : data)
-                fmt::print("{:02x} ", c);
-            fmt::print("\n");
+                    std::set<uint16_t> keysPressed;
+                    std::ranges::set_difference(newKeyboardState,
+                        currentKeyboardState,
+                        std::inserter(keysPressed, keysPressed.begin()));
+
+                    std::set<uint16_t> keysReleased;
+                    std::ranges::set_difference(currentKeyboardState,
+                        newKeyboardState,
+                        std::inserter(keysReleased, keysReleased.begin()));
+
+                    for (uint16_t k : keysPressed)
+                        pressReleaseKey(k, true, 0);
+                    for (uint16_t k : keysReleased)
+                        pressReleaseKey(k, false, 0);
+
+                    currentKeyboardState = newKeyboardState;
+                    break;
+                }
+
+                default:
+                    fmt::print("Unhandled packet: ");
+                    for (uint8_t c : data)
+                        fmt::print("{:02x} ", c);
+                    fmt::print("\n");
+            }
         }
     }
     hid_exit();
