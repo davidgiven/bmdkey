@@ -6,6 +6,7 @@
 #include <set>
 #include <algorithm>
 #include <ranges>
+#include <map>
 #include <hidapi.h>
 #include <fmt/format.h>
 #include <fakekey/fakekey.h>
@@ -13,15 +14,66 @@
 #include <X11/Xatom.h>
 
 #define MAX_STR 255
+#define WHEEL_STEP 30000
 
 static Display* display;
 static Window window;
 static FakeKey* fakekey;
 static std::set<uint16_t> currentKeyboardState;
-static int min_keycode, max_keycode;
-static int n_keysyms_per_keycode;
-static KeySym* keysyms;
+static int minKeycode;
+static int maxKeycode;
 static int lastModifiedKey = 0;
+
+static const std::vector<KeySym> MODIFIERS = {XK_Alt_L, XK_Meta_L, XK_Super_L};
+
+static const std::map<int, std::pair<KeySym, bool>> KEYMAP = {
+    {0x01, {XK_F1, false} }, /* SMART INSRT */
+    {0x02, {XK_F2, false} }, /* APPEND */
+    {0x03, {XK_F3, false} }, /* RIPL O/WR */
+    {0x04, {XK_F4, false} }, /* CLOSE UP */
+    {0x05, {XK_F5, false} }, /* PLACE ON TOP */
+    {0x06, {XK_F6, false} }, /* SRC O/WR */
+    {0x07, {XK_F7, false} }, /* IN */
+    {0x08, {XK_F8, false} }, /* OUT */
+    {0x09, {XK_F9, false} }, /* TRIM IN */
+    {0x0a, {XK_F10, false}}, /* TRIM OUT */
+    {0x0b, {XK_F11, false}}, /* ROLL */
+    {0x0c, {XK_F12, false}}, /* SLIP SRC */
+    {0x0d, {XK_F13, false}}, /* SLIP DEST */
+    {0x0e, {XK_F14, false}}, /* TRANS DUR */
+    {0x0f, {XK_F15, false}}, /* CUT */
+    {0x10, {XK_F16, false}}, /* DIS */
+    {0x11, {XK_F17, false}}, /* SMTH CUT */
+
+    {0x1a, {XK_F18, false}}, /* SOURCE */
+    {0x1b, {XK_F19, false}}, /* TIMELINE */
+    {0x1c, {XK_F20, false}}, /* SHTL */
+    {0x1d, {XK_F21, false}}, /* JOG */
+    {0x1e, {XK_F22, false}}, /* SCRL */
+
+    {0x31, {XK_F1, true}  }, /* ESC */
+    {0x1f, {XK_F2, true}  }, /* SYNC BIN */
+    {0x2c, {XK_F3, true}  }, /* AUDIO LEVEL */
+    {0x2d, {XK_F4, true}  }, /* FULL VIEW */
+    {0x22, {XK_F5, true}  }, /* TRANS */
+    {0x2f, {XK_F6, true}  }, /* SPLIT */
+    {0x2e, {XK_F7, true}  }, /* SNAP */
+    {0x2b, {XK_F8, true}  }, /* RIPL DEL */
+
+    {0x33, {XK_F10, true} }, /* CAM1 */
+    {0x34, {XK_F11, true} }, /* CAM2 */
+    {0x35, {XK_F12, true} }, /* CAM3 */
+    {0x36, {XK_F13, true} }, /* CAM4 */
+    {0x37, {XK_F14, true} }, /* CAM5 */
+    {0x38, {XK_F15, true} }, /* CAM6 */
+    {0x39, {XK_F16, true} }, /* CAM7 */
+    {0x3a, {XK_F17, true} }, /* CAM8 */
+    {0x3b, {XK_F18, true} }, /* CAM9 */
+    {0x2c, {XK_F19, true} }, /* LIVE O/WR */
+    {0x25, {XK_F20, true} }, /* VIDEO ONLY */
+    {0x26, {XK_F21, true} }, /* AUDIO ONLY */
+    {0x3c, {XK_F22, true} }, /* STOP/PLAY */
+};
 
 static void checkerror(int res)
 {
@@ -90,12 +142,14 @@ static uint64_t getInt16(const uint8_t* p)
     return ((uint64_t)p[0] << 0) | ((uint64_t)p[1] << 8);
 }
 
+static uint32_t getInt32(const uint8_t* p)
+{
+    return ((uint32_t)getInt16(p) << 0) | ((uint32_t)getInt16(p + 2) << 16);
+}
+
 static uint64_t getInt64(const uint8_t* p)
 {
-    return ((uint64_t)p[0] << 0) | ((uint64_t)p[1] << 8) |
-           ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
-           ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
-           ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
+    return ((uint64_t)getInt32(p) << 0) | ((uint64_t)getInt32(p + 4) << 32);
 }
 
 static void putInt64(uint8_t* p, uint64_t value)
@@ -209,29 +263,39 @@ static void authenticate(HidDevice& device)
         throw HidException("unable to authenticate keyboard");
 }
 
-static void pressReleaseKey(int keynum, bool pressed, int flags)
+static void pressReleaseKey(int keynum, bool pressed)
 {
-    KeySym keysym = (keynum + 0xe000) | 0x1000000;
+    auto it = KEYMAP.find(keynum);
+    if (it == KEYMAP.end())
+        return;
+
+    KeySym keysym = it->second.first;
+    KeySym keysyms[] = {keysym, keysym};
+
     KeyCode code = XKeysymToKeycode(display, keysym);
     if (!code)
     {
-        lastModifiedKey = (lastModifiedKey + 1) % 10;
-
-        int index = (max_keycode - min_keycode - lastModifiedKey - 1) *
-                    n_keysyms_per_keycode;
-        keysyms[index] = keysym;
-
         XChangeKeyboardMapping(display,
-            min_keycode,
-            n_keysyms_per_keycode,
-            keysyms,
-            max_keycode - min_keycode);
+            /* first_keycode= */ maxKeycode - 1,
+            /* keysyms_per_keycode= */ 2,
+            /* keysyms= */ keysyms,
+            /* num_codes= */ 1);
         XSync(display, False);
-
-        code = XKeysymToKeycode(display, keysym);
+        code = maxKeycode - 1;
     }
 
-    fakekey_send_keyevent(fakekey, code, pressed, flags);
+    fakekey_send_keyevent(
+        fakekey, code, pressed, it->second.second ? FAKEKEYMOD_SHIFT : 0);
+}
+
+static void pressReleaseModifiers(bool pressed)
+{
+    for (KeySym keysym : MODIFIERS)
+    {
+        fakekey_send_keyevent(
+            fakekey, XKeysymToKeycode(display, keysym), pressed, 0);
+        XSync(display, false);
+    }
 }
 
 int main()
@@ -243,15 +307,11 @@ int main()
         []()
         {
             for (uint16_t k : currentKeyboardState)
-                pressReleaseKey(k, false, 0);
+                pressReleaseKey(k, false);
+            pressReleaseModifiers(false);
         });
 
-    XDisplayKeycodes(display, &min_keycode, &max_keycode);
-
-    keysyms = XGetKeyboardMapping(display,
-        min_keycode,
-        max_keycode - min_keycode + 1,
-        &n_keysyms_per_keycode);
+    XDisplayKeycodes(display, &minKeycode, &maxKeycode);
 
     hid_init();
     {
@@ -259,11 +319,35 @@ int main()
         authenticate(device);
 
         device.send({3, 0, 0, 0, 0, 0, 0});
+        int32_t sentWheelPosition = 0;
+        int32_t wheelPosition = 0;
         for (;;)
         {
             auto data = device.recv();
             switch (data[0])
             {
+                case 3:
+                {
+                    /* wheel packet */
+                    int32_t delta = getInt32(&data[2]);
+                    wheelPosition += delta;
+                    for (;;)
+                    {
+                        int32_t totalDelta = wheelPosition - sentWheelPosition;
+                        if (abs(totalDelta) < WHEEL_STEP)
+                            break;
+
+                        int button = (totalDelta < 0) ? 4 : 5;
+                        sentWheelPosition +=
+                            (totalDelta < 0) ? -WHEEL_STEP : WHEEL_STEP;
+                        XTestFakeButtonEvent(display, button, true, 0);
+                        XSync(display, false);
+                        XTestFakeButtonEvent(display, button, false, 0);
+                        XSync(display, false);
+                    }
+                    break;
+                }
+
                 case 4:
                 {
                     /* Keyboard packet */
@@ -285,10 +369,22 @@ int main()
                         newKeyboardState,
                         std::inserter(keysReleased, keysReleased.begin()));
 
+                    if (currentKeyboardState.empty() &&
+                        !newKeyboardState.empty())
+                    {
+                        pressReleaseModifiers(true);
+                    }
+
                     for (uint16_t k : keysPressed)
-                        pressReleaseKey(k, true, 0);
+                        pressReleaseKey(k, true);
                     for (uint16_t k : keysReleased)
-                        pressReleaseKey(k, false, 0);
+                        pressReleaseKey(k, false);
+
+                    if (!currentKeyboardState.empty() &&
+                        newKeyboardState.empty())
+                    {
+                        pressReleaseModifiers(false);
+                    }
 
                     currentKeyboardState = newKeyboardState;
                     break;
