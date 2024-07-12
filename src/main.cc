@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <ranges>
 #include <map>
+#include <chrono>
 #include <hidapi.h>
 #include <fmt/format.h>
 #include <fakekey/fakekey.h>
@@ -15,6 +16,7 @@
 
 #define MAX_STR 255
 #define WHEEL_STEP 30000
+#define TIMEOUT_MS (60 * 1000)
 
 static Display* display;
 static Window window;
@@ -178,6 +180,10 @@ private:
     std::string _message;
 };
 
+class TimeoutException : public std::exception
+{
+};
+
 class HidDevice
 {
 public:
@@ -224,11 +230,14 @@ public:
         checkError(hid_write(_handle, &data[0], data.size()));
     }
 
-    std::vector<uint8_t> recv()
+    std::vector<uint8_t> recv(int msTimeout)
     {
         std::vector<uint8_t> data(64);
 
-        int res = hid_read(_handle, &data[0], sizeof(data));
+        int res = hid_read_timeout(_handle, &data[0], sizeof(data), msTimeout);
+        if (res == 0)
+            throw TimeoutException();
+
         checkError(res);
         data.resize(res);
 
@@ -261,6 +270,7 @@ static void authenticate(HidDevice& device)
     auto result = device.recvFeatureReport(6, 10);
     if ((result.at(0) != 6) || (result.at(1) != 4))
         throw HidException("unable to authenticate keyboard");
+    fmt::print("Authenticated\n");
 }
 
 static void pressReleaseKey(int keynum, bool pressed)
@@ -319,82 +329,106 @@ int main()
         authenticate(device);
 
         device.send({3, 0, 0, 0, 0, 0, 0});
+        device.send({2, 0xff, 0xff, 0xff, 0xff});
         int32_t sentWheelPosition = 0;
         int32_t wheelPosition = 0;
+        int msTimeout = TIMEOUT_MS;
         for (;;)
         {
-            auto data = device.recv();
-            switch (data[0])
+            try
             {
-                case 3:
+                auto beforeTime = std::chrono::steady_clock::now();
+                auto data = device.recv(msTimeout);
+                auto afterTime = std::chrono::steady_clock::now();
+                msTimeout -=
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        afterTime - beforeTime)
+                        .count();
+
+                switch (data[0])
                 {
-                    /* wheel packet */
-                    int32_t delta = getInt32(&data[2]);
-                    wheelPosition += delta;
-                    for (;;)
+                    case 3:
                     {
-                        int32_t totalDelta = wheelPosition - sentWheelPosition;
-                        if (abs(totalDelta) < WHEEL_STEP)
-                            break;
+                        /* wheel packet */
+                        int32_t delta = getInt32(&data[2]);
+                        wheelPosition += delta;
+                        for (;;)
+                        {
+                            int32_t totalDelta =
+                                wheelPosition - sentWheelPosition;
+                            if (abs(totalDelta) < WHEEL_STEP)
+                                break;
 
-                        int button = (totalDelta < 0) ? 4 : 5;
-                        sentWheelPosition +=
-                            (totalDelta < 0) ? -WHEEL_STEP : WHEEL_STEP;
-                        XTestFakeButtonEvent(display, button, true, 0);
-                        XSync(display, false);
-                        XTestFakeButtonEvent(display, button, false, 0);
-                        XSync(display, false);
+                            int button = (totalDelta < 0) ? 4 : 5;
+                            sentWheelPosition +=
+                                (totalDelta < 0) ? -WHEEL_STEP : WHEEL_STEP;
+                            XTestFakeButtonEvent(display, button, true, 0);
+                            XSync(display, false);
+                            XTestFakeButtonEvent(display, button, false, 0);
+                            XSync(display, false);
+                        }
+                        break;
                     }
-                    break;
+
+                    case 4:
+                    {
+                        /* Keyboard packet */
+                        std::set<uint16_t> newKeyboardState;
+                        for (int i = 0; i < 6; i++)
+                        {
+                            uint16_t keycode = getInt16(&data[1 + i * 2]);
+                            if (keycode)
+                                newKeyboardState.insert(
+                                    getInt16(&data[1 + i * 2]));
+                        }
+
+                        std::set<uint16_t> keysPressed;
+                        std::ranges::set_difference(newKeyboardState,
+                            currentKeyboardState,
+                            std::inserter(keysPressed, keysPressed.begin()));
+
+                        std::set<uint16_t> keysReleased;
+                        std::ranges::set_difference(currentKeyboardState,
+                            newKeyboardState,
+                            std::inserter(keysReleased, keysReleased.begin()));
+
+                        if (currentKeyboardState.empty() &&
+                            !newKeyboardState.empty())
+                        {
+                            pressReleaseModifiers(true);
+                        }
+
+                        for (uint16_t k : keysPressed)
+                            pressReleaseKey(k, true);
+                        for (uint16_t k : keysReleased)
+                            pressReleaseKey(k, false);
+
+                        if (!currentKeyboardState.empty() &&
+                            newKeyboardState.empty())
+                        {
+                            pressReleaseModifiers(false);
+                        }
+
+                        currentKeyboardState = newKeyboardState;
+                        break;
+                    }
+
+                    default:
+                        fmt::print("Unhandled packet: ");
+                        for (uint8_t c : data)
+                            fmt::print("{:02x} ", c);
+                        fmt::print("\n");
                 }
+            }
+            catch (const TimeoutException& e)
+            {
+                msTimeout = 0;
+            }
 
-                case 4:
-                {
-                    /* Keyboard packet */
-                    std::set<uint16_t> newKeyboardState;
-                    for (int i = 0; i < 6; i++)
-                    {
-                        uint16_t keycode = getInt16(&data[1 + i * 2]);
-                        if (keycode)
-                            newKeyboardState.insert(getInt16(&data[1 + i * 2]));
-                    }
-
-                    std::set<uint16_t> keysPressed;
-                    std::ranges::set_difference(newKeyboardState,
-                        currentKeyboardState,
-                        std::inserter(keysPressed, keysPressed.begin()));
-
-                    std::set<uint16_t> keysReleased;
-                    std::ranges::set_difference(currentKeyboardState,
-                        newKeyboardState,
-                        std::inserter(keysReleased, keysReleased.begin()));
-
-                    if (currentKeyboardState.empty() &&
-                        !newKeyboardState.empty())
-                    {
-                        pressReleaseModifiers(true);
-                    }
-
-                    for (uint16_t k : keysPressed)
-                        pressReleaseKey(k, true);
-                    for (uint16_t k : keysReleased)
-                        pressReleaseKey(k, false);
-
-                    if (!currentKeyboardState.empty() &&
-                        newKeyboardState.empty())
-                    {
-                        pressReleaseModifiers(false);
-                    }
-
-                    currentKeyboardState = newKeyboardState;
-                    break;
-                }
-
-                default:
-                    fmt::print("Unhandled packet: ");
-                    for (uint8_t c : data)
-                        fmt::print("{:02x} ", c);
-                    fmt::print("\n");
+            if (msTimeout <= 0)
+            {
+                msTimeout = TIMEOUT_MS;
+                authenticate(device);
             }
         }
     }
