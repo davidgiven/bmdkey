@@ -7,9 +7,9 @@ package(name="fmt", package="fmt")
 package(name="libfakekey", package="libfakekey")
 
 cxxprogram(
-    name="se-unlock",
+    name="bmdkey",
     srcs=["src/main.cc"],
     deps=["+hidapi-libusb", "+fmt", "+libfakekey"],
 )
 
-export(name="all", items={"se-unlock": "+se-unlock"})
+export(name="all", items={"bmdkey": "+bmdkey"})
