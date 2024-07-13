@@ -15,7 +15,7 @@ It uses [smunaut's algorithm for unlocking the
 device](https://github.com/smunaut/blackmagic-misc). Without this, the device is
 a paperweight unless you have Resolve running.
 
-<iframe width="560" height="315" src="https://www.youtube.com/embed/UoIlwze5xp4?si=8X7iZ6ykQxiWAlHv" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+[![Watch me write it!](https://img.youtube.com/vi/UoIlwze5xp4/0.jpg)](https://www.youtube.com/watch?v=UoIlwze5xp4)
 
 Why?
 ----
